@@ -1,4 +1,5 @@
 ## Modified to take in sEEG data (swapped Poisson observation model for Gaussian likelihood)
+## Further modified: per-module L2 (prior / posterior / encoder / readout), best-validation epoch recorded
 
 import functools
 
@@ -52,7 +53,9 @@ def create_train_state(
     num_neurons = xs['spikes'].shape[-1],
     constrain_prior = config.constrain_prior,
     use_gaussian = config.use_gaussian,             # added for sEEG data
-    use_channel_gating = config.use_channel_gating  # added for sEEG data
+    use_channel_gating = config.use_channel_gating,  # added for sEEG data
+    posterior_input_mask = (tuple(config.posterior_input_mask)
+                            if config.get('posterior_input_mask') is not None else None)
   )
   if ckptdir is not None:
     raw_restored = checkpoints.restore_checkpoint(
@@ -96,10 +99,17 @@ def apply_model(
   lambda_sparse: float,
   rng: PRNGKey
 ):
-  ntrgru_mask = traverse_util.path_aware_map(
-    lambda path, _: 1 if 'non_task_related_gru' in path
-    else 2, state.params
-  )
+  # L2 groups (weight matrices only; biases, log variances and channel gates are not penalized):
+  # 0 prior flow, 1 posterior SDE, 2 inference (encoder) GRUs, 3 readout, -1 not penalized.
+  # Replaces the original 'non_task_related_gru' mask, which matched no parameter of this model, so that
+  # every parameter received only the 1e-7 fallback penalty.
+  def _l2_group(path, _):
+    if path[-1] != 'kernel':
+      return -1
+    top = path[0]
+    return {'prior_process': 0, 'posterior_process': 1, 'inference_network': 2,
+            'task_related_latents_to_neurons': 3}.get(top, -1)
+  l2_mask = traverse_util.path_aware_map(_l2_group, state.params)
 
   ortho_mask = traverse_util.path_aware_map(
     lambda path, _: 1 if 'task_related_latents_to_neurons' in path
@@ -144,11 +154,11 @@ def apply_model(
     else:
       sparse_loss = 0.0
 
-    # existing L2 regularization
+    # L2 regularization, one coefficient per module group (l2_coeff = (prior, posterior, encoder, readout))
     loss += sum(
-      l2_loss(w, alpha=l2_coeff) if label==1 
-      else l2_loss(w, alpha=1e-7)
-      for label, w in zip(jax.tree.leaves(ntrgru_mask), jax.tree.leaves(params))
+      l2_loss(w, alpha=l2_coeff[label]) if label >= 0
+      else 0.
+      for label, w in zip(jax.tree.leaves(l2_mask), jax.tree.leaves(params))
     )
     return loss, (nll_loss, kld_loss, sparse_loss, outputs, gates)
   
@@ -156,6 +166,11 @@ def apply_model(
   (loss, (nll, kld, sparse, outputs, gates)), grads = grad_fn(state.params)
 
   return grads, loss, nll, kld, sparse, gates
+
+def l2_coeffs(config):
+  """(prior, posterior, encoder, readout) L2 coefficients as a hashable tuple"""
+  return (float(config.l2_prior), float(config.l2_posterior), float(config.l2_encoder), float(config.l2_readout))
+
 
 @jax.jit
 def update_model(
@@ -208,7 +223,7 @@ def train_epoch(
       config.beta,
       config.beta_inc_rate, 
       config.lossw_inc_rate,
-      config.l2_coeff,
+      l2_coeffs(config),
       beta_counter,
       lossw_counter, 
       learning_rate_fn,
@@ -248,7 +263,8 @@ def train_and_evaluate(
   datapath: str,
   workdir: str,
   randseedpath: str = None,
-  ckpt_save: bool = True
+  ckpt_save: bool = True,
+  basedir: str = None
 ) -> train_state.TrainState:
   """Execute model training and evaluation loop.
   Args:
@@ -266,12 +282,14 @@ def train_and_evaluate(
     randseedpath,
     k_cv=config.k_cv, 
     n_splits=config.n_splits,
-    baseline_fit=config.baseline_fit
+    baseline_fit=config.baseline_fit,
+    basedir=basedir if basedir is not None else os.path.dirname(workdir),
+    balance_seed=config.seed if config.get('balance_languages', False) else None
   )
   print(f"Data loaded. Train size: {len(train_ds['spikes'])}")
 
   print(f"Initializing model...")
-  rng = random.PRNGKey(1) # this is the random seed that we use to initialize the model
+  rng = random.PRNGKey(config.seed)
   key_1, key_2 = random.split(rng, 2)
   train_ds_size = len(train_ds['externalinputs'])
   steps_per_epoch = train_ds_size // config.batch_size
@@ -279,6 +297,7 @@ def train_and_evaluate(
   learning_rate_fn = create_learning_rate_fn(config, steps_per_epoch)
   state = create_train_state(key_1, config, learning_rate_fn, test_ds)
   best_state = state
+  best_epoch = 0
 
   # initialize checkpointing
   mgr_options = ocp.CheckpointManagerOptions(
@@ -359,7 +378,7 @@ def train_and_evaluate(
       config.beta,
       config.beta_inc_rate,
       config.lossw_inc_rate,
-      config.l2_coeff,  
+      l2_coeffs(config),
       1e6,
       0,
       learning_rate_fn,
@@ -375,7 +394,7 @@ def train_and_evaluate(
       config.beta,
       config.beta_inc_rate,
       config.lossw_inc_rate,
-      config.l2_coeff,  
+      l2_coeffs(config),
       1e6, 
       0,
       learning_rate_fn,
@@ -384,9 +403,13 @@ def train_and_evaluate(
     )
     
     if epoch > (config.earlymiddle_epochs + annealing_epochs):
-      if val_losses[(config.earlymiddle_epochs + annealing_epochs):]:
-        if val_loss < min(val_losses[(config.earlymiddle_epochs + annealing_epochs):]):
-          best_state = state
+      # best-validation state after KL annealing. The first epoch of the window is a candidate too (previously it was
+      # skipped because the window was still empty, so a fit whose validation loss only rose afterwards kept the
+      # untrained initial state, best_epoch 0)
+      window = val_losses[(config.earlymiddle_epochs + annealing_epochs):]
+      if not window or val_loss < min(window):
+        best_state = state
+        best_epoch = epoch
             
     if gate_mean is not None:
       logging.info(
@@ -444,7 +467,8 @@ def train_and_evaluate(
     }
 
     ckpt = {
-      'model': best_state, 
+      'model': best_state,           # best-validation state after KL annealing (see best_epoch)
+      'best_epoch': best_epoch,
       'config': config.to_dict(), 
       'losses': losses, 
       'perms': perms
@@ -481,7 +505,17 @@ def train_and_evaluate(
 
   return min(ckpt['losses']['val_losses'][(config.earlymiddle_epochs + annealing_epochs):])
 
-def get_datasets(datapath, workdir, randseedpath=None, k_cv=1, n_splits=5, baseline_fit=False):
+def balanced_trials(language_labels, seed):
+  """sorted indices of a random language-balanced subset: each language subsampled to the smaller one's count"""
+  rng = np.random.default_rng(seed)
+  n = np.bincount(language_labels).min()
+  return np.sort(np.concatenate([rng.choice(np.flatnonzero(language_labels == l), n, replace=False)
+                                 for l in np.unique(language_labels)]))
+
+def get_datasets(datapath, workdir, randseedpath=None, k_cv=1, n_splits=5, baseline_fit=False, basedir=None,
+                 balance_seed=None):
+  if basedir is None:
+    basedir = workdir
   if randseedpath:
     df = pd.read_csv(randseedpath)
     one_hot = np.array(
@@ -505,13 +539,21 @@ def get_datasets(datapath, workdir, randseedpath=None, k_cv=1, n_splits=5, basel
   # language_labels = data['externalinputs'][:, 0, 0].astype(int)
   language_labels = (data['language_labels'].astype(int) if 'language_labels' in data 
                      else data['externalinputs'][np.arange(len(data['lengths'])), data['lengths'] // 2, 0].astype(int))
+  # balance_seed: train on a random language-balanced subset drawn from it (the folds split that subset); the
+  # subset's trial indices are saved as workdir/trials.npy
+  trials = np.arange(len(language_labels))
+  if balance_seed is not None:
+    trials = balanced_trials(language_labels, balance_seed)
+    os.makedirs(workdir, exist_ok=True)
+    np.save(os.path.join(workdir, 'trials.npy'), trials)
+    print(f"language-balanced subset (seed {balance_seed}): {len(trials)} of {len(language_labels)} trials")
   kf = StratifiedKFold(n_splits=n_splits, random_state=random_seed, shuffle=True)
   train_valid_indices = []
   test_indices = []
   np.random.seed(seed=random_seed)
-  for i, (train_valid_index, test_index) in enumerate(kf.split(data['spikes'], language_labels)):
-    train_valid_indices.append(np.random.permutation(train_valid_index))
-    test_indices.append(np.random.permutation(test_index))
+  for i, (train_valid_index, test_index) in enumerate(kf.split(trials, language_labels[trials])):
+    train_valid_indices.append(np.random.permutation(trials[train_valid_index]))
+    test_indices.append(np.random.permutation(trials[test_index]))
 
   train_indices = []
   valid_indices = []
@@ -521,7 +563,7 @@ def get_datasets(datapath, workdir, randseedpath=None, k_cv=1, n_splits=5, basel
   train_indices.append(train_valid_indices[-1][~np.isin(train_valid_indices[-1], test_indices[0])])
   valid_indices.append(train_valid_indices[-1][np.isin(train_valid_indices[-1], test_indices[0])])
 
-  baselinepath = workdir.rsplit('/', 1)[0]
+  baselinepath = basedir
 
   if os.path.exists(baselinepath + '/baseline.npy'):
     baselines = np.load(baselinepath + '/baseline.npy')

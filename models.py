@@ -278,6 +278,10 @@ class FINDR(nn.Module):
   constrain_prior: bool = False
   use_gaussian: bool = False           # use Gaussian observation model for continuous data (e.g., sEEG)
   use_channel_gating: bool = False     # enable per-channel gating (for multi-region sEEG data)
+  posterior_input_mask: Sequence[float] = None  # per-input multiplier for the encoder / posterior only (None = all on);
+                                                # e.g. (0, 0, 1, 1) withholds the language one-hot from the posterior,
+                                                # which then has to infer language from the neural data; the prior flow
+                                                # always receives all inputs
 
   def setup(self):
     self.inference_network = SimpleBiGRU(
@@ -326,10 +330,16 @@ class FINDR(nn.Module):
     key_1, key_2, key_3, key_4, key_5, = random.split(rng, 5)
     batch_size = len(trial_lengths)
 
+    # inputs seen by the encoder and the posterior (optionally masked); the prior flow gets all inputs
+    if self.posterior_input_mask is not None:
+      post_inputs = external_inputs * jnp.asarray(self.posterior_input_mask, dtype=external_inputs.dtype)
+    else:
+      post_inputs = external_inputs
+
     # encode (with gated inputs if enabled, original inputs otherwise)
     hs = self.inference_network(
       spike_inputs,
-      external_inputs,
+      post_inputs,
       trial_lengths,
       key_1
     )
@@ -349,7 +359,7 @@ class FINDR(nn.Module):
     _, (z, mu_phi, mu, std) = self.posterior_process(
       carry_dl, 
       hs,
-      external_inputs,
+      post_inputs,
       noise_posterior
     )
     mu_theta = self.prior_process(
