@@ -30,20 +30,20 @@ flags.DEFINE_float('lambda_sparse', 1e-4, 'Lambda sparse')
 flags.DEFINE_boolean('search_sparse', False, 'Run Optuna search for lambda_sparse')
 flags.DEFINE_integer('seed', 0, 'JAX random seed for model initialization')
 flags.DEFINE_integer('k_cv', 1, 'Cross-validation fold to train (1-5)')
-flags.DEFINE_integer('num_epochs', 3000, 'Number of training epochs')
+flags.DEFINE_integer('num_epochs', 400, 'Number of training epochs')
 flags.DEFINE_string('basedir', None, 'Base directory for baseline.npy (defaults to parent of workdir)')
 flags.DEFINE_float('alpha', 0.039, 'Euler step in units of the time constant: bin width / tau '
                    '(0.039 = 7.8 ms / 200 ms at 128 Hz; 0.2 = 40 ms / 200 ms)')
 flags.DEFINE_integer('anneal_epochs', 200, 'Epochs for the KL weight to reach 99 %; best-validation selection '
                      'starts after them (original: 458, beta_inc_rate = 0.99)')
-flags.DEFINE_float('beta', 2.0, 'Weight of the KL term between posterior and prior drifts (original: 2)')
+flags.DEFINE_float('beta', 4.0, 'Weight of the KL term between posterior and prior drifts (original: 2)')
 flags.DEFINE_boolean('posterior_language', True, 'Give the encoder / posterior the language one-hot (inputs 0, 1). '
                      'False: withheld (posterior must infer language from the data); the prior flow always gets it')
-flags.DEFINE_float('l2_prior', 1e-3, 'L2 on prior-flow weight matrices')
-flags.DEFINE_float('l2_posterior', 1e-3, 'L2 on posterior-SDE weight matrices')
-flags.DEFINE_float('l2_encoder', 1e-4, 'L2 on inference-GRU weight matrices')
-flags.DEFINE_float('l2_readout', 1e-4, 'L2 on readout weight matrix')
-flags.DEFINE_boolean('balance_languages', False, 'Train on a random language-balanced subset of trials drawn from '
+flags.DEFINE_float('l2_prior', 3.0, 'L2 on prior-flow weight matrices')
+flags.DEFINE_float('l2_posterior', 3.0, 'L2 on posterior-SDE weight matrices')
+flags.DEFINE_float('l2_encoder', 0.1, 'L2 on inference-GRU weight matrices')
+flags.DEFINE_float('l2_readout', 0.1, 'L2 on readout weight matrix')
+flags.DEFINE_boolean('balance_languages', True, 'Train on a random language-balanced subset of trials drawn from '
                      '--seed (the larger language subsampled to the smaller one\'s count; the folds split that subset)')
 
 def get_config(k_cv, num_epochs, learning_rate, feature_size, net_size, latent_size, lambda_sparse=1e-4, seed=0):
