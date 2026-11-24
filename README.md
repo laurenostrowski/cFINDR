@@ -1,4 +1,4 @@
-<h2 align='center'>gcFINDR: Gaussian continuous Flow-field Inference from Neural Data using Deep Recurrent Networks</h2>
+<h2 align='center'>cFINDR: continuous Flow-field Inference from Neural Data using Deep Recurrent Networks</h2>
 
 This repository contains a modified version of [FINDR](https://github.com/Brody-Lab/findr) adapted for **continuous sEEG recordings** rather than spike trains. The core architecture — separating task-relevant dynamics from noise and learning a governing differential equation — is preserved, but the observation model has been replaced to accommodate log high-gamma power envelopes extracted from multi-site sEEG.
 
@@ -41,7 +41,7 @@ This version extends that framework to the continuous-valued, multi-region sEEG 
 ## Installation
 
 ```bash
-git clone https://github.com/laurenostrowski/gcFINDR.git
+git clone https://github.com/laurenostrowski/cFINDR.git
 module load anaconda/2024.10
 conda create --name findr python=3.12
 conda activate findr
